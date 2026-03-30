@@ -1,17 +1,64 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+
 from websocket.manager import ConnectionManager
+from websocket.emitter import EventEmitter
+from state.store import StateStore
+from pubsub.manager import RedisPubSubManager
+from integration.engine_connector import EngineConnector
+from api.routes import router
+from api.demo import demo_router
 
-app = FastAPI()
 
-manager = ConnectionManager()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize Redis (graceful fallback if Redis not running)
+    try:
+        await app.state.redis_manager.initialize()
+        await app.state.manager.initialize()
+    except Exception as e:
+        print(f"[WARNING] Redis unavailable, running without pub/sub: {e}")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Core components
+redis_manager = RedisPubSubManager()
+manager = ConnectionManager(redis_manager)
+emitter = EventEmitter(manager)
+state_store = StateStore()
+engine_connector = EngineConnector(state_store, emitter)
+
+# Attach to app.state so routes can access them
+app.state.redis_manager = redis_manager
+app.state.manager = manager
+app.state.emitter = emitter
+app.state.state_store = state_store
+app.state.engine_connector = engine_connector
+
+app.include_router(router, prefix="/api")
+app.include_router(demo_router, prefix="/api")
+
 
 @app.get("/")
 def home():
     return {"message": "Backend running"}
 
+
 @app.websocket("/ws/{workflow_id}")
-async def websocket_endpoint(websocket: WebSocket, workflow_id: str):
-    await manager.connect(websocket, workflow_id)
+async def websocket_endpoint(websocket: WebSocket, workflow_id: str,
+                              client_type: str = "frontend"):
+    await manager.connect(websocket, workflow_id, client_type)
     try:
         while True:
             await websocket.receive_text()
